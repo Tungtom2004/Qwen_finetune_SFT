@@ -1,6 +1,7 @@
 from pathlib import Path
 from peft import PeftModel
 import torch
+
 from transformers import (
     BitsAndBytesConfig, 
     Qwen2VLForConditionalGeneration, 
@@ -17,6 +18,99 @@ import importlib
 import inspect
 from types import ModuleType
 from typing import Callable, List
+import math 
+import requests
+from io import BytesIO
+from PIL import Image
+
+def get_image_info(
+    image_path_or_url: str,
+    min_pixels: int,
+    max_pixels: int,
+    resized_w: int,
+    resized_h: int,
+    patch_size: int,
+):
+    """
+    Load + resize image for Qwen-VL
+    Supports local path and HTTP(S) URL
+    """
+
+    # ---- Load image ----
+    if image_path_or_url.startswith("http"):
+        response = requests.get(image_path_or_url, timeout=10)
+        response.raise_for_status()
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+    else:
+        image = Image.open(image_path_or_url).convert("RGB")
+
+    w, h = image.size
+    num_pixels = w * h
+
+    # ---- Resize logic ----
+    if num_pixels < min_pixels or num_pixels > max_pixels:
+        image = image.resize((resized_w, resized_h), Image.BICUBIC)
+
+    # ---- Ensure divisible by patch size ----
+    new_w = math.floor(image.size[0] / patch_size) * patch_size
+    new_h = math.floor(image.size[1] / patch_size) * patch_size
+    image = image.resize((new_w, new_h), Image.BICUBIC)
+
+    return image
+
+def llava_to_openai(conversations, is_video=False):
+    """
+    Convert LLaVA-style conversation to OpenAI/Qwen format
+    """
+
+    role_map = {
+        "human": "user",
+        "gpt": "assistant",
+    }
+
+    outputs = []
+    for msg in conversations:
+        role = role_map.get(msg["from"], msg["from"])
+        content = msg["value"]
+        outputs.append({
+            "role": role,
+            "content": content,
+        })
+
+    return outputs
+
+def pad_sequence(
+    sequences,
+    padding_side="right",
+    padding_value=0,
+):
+    """
+    Pad a list of 1D torch tensors to same length
+    """
+
+    max_len = max(seq.size(0) for seq in sequences)
+
+    padded = []
+    for seq in sequences:
+        pad_len = max_len - seq.size(0)
+        if pad_len == 0:
+            padded.append(seq)
+            continue
+
+        pad_tensor = torch.full(
+            (pad_len,),
+            padding_value,
+            dtype=seq.dtype,
+            device=seq.device,
+        )
+
+        if padding_side == "right":
+            padded.append(torch.cat([seq, pad_tensor], dim=0))
+        else:
+            padded.append(torch.cat([pad_tensor, seq], dim=0))
+
+    return torch.stack(padded, dim=0)
+
 
 def disable_torch_init():
     """

@@ -1,8 +1,11 @@
 import os
 import ast
+import json
 import pathlib
-import torch
+from datetime import datetime
+from typing import Any, Dict, Optional
 
+import torch
 from transformers import (
     AutoProcessor,
     AutoConfig,
@@ -20,74 +23,210 @@ from peft import LoraConfig, get_peft_model
 from src.trainer import QwenSFTTrainer
 from src.dataset import make_supervised_data_module
 from src.params import ModelArguments, DataArguments, TrainingArguments
-from train.train_utils import (
+from src.train.train_utils import (
     get_peft_state_maybe_zero_3,
     get_peft_state_non_lora_maybe_zero_3,
     safe_save_model_for_hf_trainer,
 )
 
-from monkey_patch_forward import (
+from src.train.monkey_patch_forward import (
     replace_qwen_2_with_mixed_modality_forward,
     replace_qwen2_5_with_mixed_modality_forward,
     replace_qwen3_with_mixed_modality_forward,
     replace_qwen3_vl_moe_with_mixed_modality_forward,
 )
-from monkey_patch_vision import replace_qwen2_5_vision
+from src.train.monkey_patch_vision import replace_qwen2_5_vision
 
 
 # =========================================================
-# Debug callback: print prediction vs golden
+# Helpers: make shapes safe for Qwen-VL
 # =========================================================
 
-class PrintSampleCallback(TrainerCallback):
-    def __init__(self, processor, every_n_steps=1, max_new_tokens=128):
+def _to_tensor(x: Any, device: Optional[torch.device] = None) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        t = x
+    else:
+        t = torch.as_tensor(x)
+    if device is not None:
+        t = t.to(device)
+    return t
+
+
+def ensure_ids_2d(ids: Any, device: Optional[torch.device] = None) -> torch.Tensor:
+    """
+    Force token ids into shape (B, L).
+    Supports: tensor/list, (L,), (B,L), (B, num_return, L), etc.
+    """
+    ids = _to_tensor(ids, device=device)
+
+    if ids.ndim == 1:
+        ids = ids.unsqueeze(0)  # (1, L)
+    elif ids.ndim == 3:
+        # common from generate: (B, num_return, L)
+        ids = ids[:, 0, :]      # take first
+    elif ids.ndim > 3:
+        ids = ids.reshape(ids.shape[0], -1)
+    return ids
+
+
+def ensure_grid_thw(grid: Any, device: Optional[torch.device] = None) -> torch.Tensor:
+    """
+    Qwen2-VL expects image_grid_thw with shape (B, 3).
+    Fix common broken cases:
+      - (3,) -> (1,3)
+      - (B,1,3) -> (B,3)
+    """
+    g = _to_tensor(grid, device=device).long()
+
+    if g.ndim == 1:
+        g = g.unsqueeze(0)  # (1,3)
+    elif g.ndim == 3 and g.shape[1] == 1 and g.shape[2] == 3:
+        g = g.squeeze(1)    # (B,3)
+
+    if g.ndim != 2 or g.shape[1] != 3:
+        raise ValueError(f"[FATAL] image_grid_thw must be (B,3). Got {tuple(g.shape)}")
+    return g
+
+
+def ensure_pixel_values(pv: Any, device: Optional[torch.device] = None) -> torch.Tensor:
+    return _to_tensor(pv, device=device)
+
+
+def batch_to_device_and_fix(
+    batch: Dict[str, Any],
+    model_device: torch.device,
+) -> Dict[str, Any]:
+    """
+    Move tensors to GPU + fix shapes for Qwen-VL forward.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(model_device)
+        else:
+            out[k] = v
+
+    if "image_grid_thw" in out and out["image_grid_thw"] is not None:
+        out["image_grid_thw"] = ensure_grid_thw(out["image_grid_thw"], device=model_device)
+
+    if "pixel_values" in out and out["pixel_values"] is not None:
+        out["pixel_values"] = ensure_pixel_values(out["pixel_values"], device=model_device)
+
+    if "input_ids" in out and out["input_ids"] is not None:
+        out["input_ids"] = ensure_ids_2d(out["input_ids"], device=model_device)
+
+    if "attention_mask" in out and out["attention_mask"] is not None:
+        out["attention_mask"] = ensure_ids_2d(out["attention_mask"], device=model_device)
+
+    return out
+
+
+# =========================================================
+# Debug + Logging callback: print + save jsonl
+# =========================================================
+
+class LogSampleCallback(TrainerCallback):
+    """
+    Correct SFT logging:
+      - generate ONLY from prompt (no golden leakage)
+      - decode ONLY newly generated tokens
+    """
+
+    def __init__(
+        self,
+        processor,
+        every_n_steps: int = 50,
+        max_new_tokens: int = 128,
+        save_path: str = "outputs/train_predictions.jsonl",
+        print_chars: int = 400,
+    ):
         self.processor = processor
-        self.every_n_steps = every_n_steps
-        self.max_new_tokens = max_new_tokens
+        self.every_n_steps = max(1, int(every_n_steps))
+        self.max_new_tokens = int(max_new_tokens)
+        self.save_path = save_path
+        self.print_chars = int(print_chars)
 
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        if not os.path.exists(save_path):
+            open(save_path, "w", encoding="utf-8").close()
+
+    @torch.no_grad()
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.every_n_steps != 0:
+        if state.global_step == 0 or state.global_step % self.every_n_steps != 0:
             return
 
-        model = kwargs["model"]
-        train_dataloader = kwargs["train_dataloader"]
+        model = kwargs.get("model")
+        train_dataloader = kwargs.get("train_dataloader")
+        if model is None or train_dataloader is None:
+            return
 
         model.eval()
 
-        batch = next(iter(train_dataloader))
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                batch[k] = v.to(model.device)
+        # 1) get batch
+        raw_batch = next(iter(train_dataloader))
+        batch = batch_to_device_and_fix(raw_batch, model_device=model.device)
 
-        with torch.no_grad():
-            gen_ids = model.generate(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch.get("pixel_values"),
-                image_grid_thw=batch.get("image_grid_thw"),
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-            )
+        # 2) compute prompt_len CORRECTLY
+        labels = batch["labels"]
+        IGNORE_INDEX = -100
+        prompt_len = int((labels[0] == IGNORE_INDEX).sum().item())
 
-        pred_text = self.processor.batch_decode(
-            gen_ids, skip_special_tokens=True
-        )[0]
+        prompt_ids = batch["input_ids"][:, :prompt_len]
+        prompt_attention = batch["attention_mask"][:, :prompt_len]
 
-        label_ids = batch["labels"].clone()
+        # 3) generate from PROMPT ONLY
+        gen_ids = model.generate(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attention,
+            pixel_values=batch.get("pixel_values"),
+            image_grid_thw=batch.get("image_grid_thw"),
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            num_return_sequences=1,
+        )
+
+        gen_ids = ensure_ids_2d(gen_ids, device=None)
+
+        # 4) decode generated part ONLY
+        gen_only = gen_ids[:, prompt_ids.shape[1]:]
+        pred_text = self.processor.tokenizer.batch_decode(
+            gen_only, skip_special_tokens=True
+        )[0].strip()
+
+        if pred_text == "":
+            pred_text = "[EMPTY_GENERATION]"
+
+        # 5) decode golden (label part)
+        label_ids = labels.detach().clone().cpu()
         label_ids[label_ids < 0] = self.processor.tokenizer.pad_token_id
-        label_text = self.processor.batch_decode(
-            label_ids.unsqueeze(0), skip_special_tokens=True
-        )[0]
+        label_ids = ensure_ids_2d(label_ids, device=None)
 
-        print("\n" + "=" * 100)
-        print(f"[STEP {state.global_step}] MODEL PREDICTION:")
-        print(pred_text)
-        print("-" * 100)
-        print("GOLDEN (LABEL):")
-        print(label_text)
-        print("=" * 100 + "\n")
+        golden_text = self.processor.tokenizer.batch_decode(
+            label_ids, skip_special_tokens=True
+        )[0].strip()
+
+        record = {
+            "time": datetime.now().isoformat(),
+            "global_step": int(state.global_step),
+            "prediction": pred_text,
+            "golden": golden_text,
+            "prompt_len": prompt_len,
+            "gen_new_tokens": gen_only.shape[1],
+        }
+
+        with open(self.save_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        print("\n" + "=" * 90)
+        print(f"[STEP {state.global_step}] saved -> {self.save_path}")
+        print(f"prompt_len={prompt_len} | gen_new_tokens={gen_only.shape[1]}")
+        print("PRED:", pred_text[: self.print_chars])
+        print("-" * 90)
+        print("GT  :", golden_text[: self.print_chars])
+        print("=" * 90 + "\n")
 
         model.train()
+
 
 
 # =========================================================
@@ -95,6 +234,7 @@ class PrintSampleCallback(TrainerCallback):
 # =========================================================
 
 local_rank = None
+
 
 def rank0_print(*args):
     if local_rank in (None, 0, "0", -1):
@@ -109,16 +249,13 @@ def set_requires_grad(params, flag: bool):
 def find_lora_targets(model, exclude=None, max_modules=-1):
     exclude = exclude or []
     targets = []
-
     for name, module in model.named_modules():
         if any(x in name for x in exclude):
             continue
         if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
             targets.append(name)
-
-    if max_modules > 0:
+    if max_modules and max_modules > 0:
         targets = targets[-max_modules:]
-
     rank0_print(f"[LoRA] target modules = {len(targets)}")
     return targets
 
@@ -130,13 +267,11 @@ def find_lora_targets(model, exclude=None, max_modules=-1):
 def train():
     global local_rank
 
-    parser = HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
-    )
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
 
-    # Dataset của bạn KHÔNG dùng video
+    # No video
     if data_args.fps is not None or data_args.nframes is not None:
         raise ValueError("Video is not supported for this SFT pipeline.")
 
@@ -146,7 +281,7 @@ def train():
         else torch.float32
     )
 
-    # Quantization
+    # Quantization args
     bnb_args = {}
     if training_args.bits in (4, 8):
         bnb_args["quantization_config"] = BitsAndBytesConfig(
@@ -161,39 +296,28 @@ def train():
 
     # Load model
     config = AutoConfig.from_pretrained(model_args.model_id)
+    attn_impl = "sdpa"
 
     if config.model_type == "qwen3_vl_moe":
         replace_qwen3_vl_moe_with_mixed_modality_forward()
         model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2",
-            **bnb_args,
+            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
         )
     elif config.model_type == "qwen3_vl":
         replace_qwen3_with_mixed_modality_forward()
         model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2",
-            **bnb_args,
+            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
         )
     elif config.model_type == "qwen2_5_vl":
         replace_qwen2_5_with_mixed_modality_forward()
         replace_qwen2_5_vision()
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2",
-            **bnb_args,
+            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
         )
     else:
         replace_qwen_2_with_mixed_modality_forward()
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            dtype=compute_dtype,
-            attn_implementation="flash_attention_2",
-            **bnb_args,
+            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
         )
 
     model.config.use_cache = False
@@ -205,8 +329,7 @@ def train():
 
     # LoRA
     if training_args.lora_enable:
-        exclude = ast.literal_eval(training_args.lora_namespan_exclude) \
-            if training_args.lora_namespan_exclude else []
+        exclude = ast.literal_eval(training_args.lora_namespan_exclude) if training_args.lora_namespan_exclude else []
         exclude += ["visual"]
 
         lora_cfg = LoraConfig(
@@ -215,9 +338,7 @@ def train():
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             target_modules=find_lora_targets(
-                model,
-                exclude=exclude,
-                max_modules=training_args.num_lora_modules,
+                model, exclude=exclude, max_modules=training_args.num_lora_modules
             ),
         )
         model = get_peft_model(model, lora_cfg)
@@ -226,9 +347,7 @@ def train():
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
     data_module = make_supervised_data_module(
-        model_id=model_args.model_id,
-        processor=processor,
-        data_args=data_args,
+        model_id=model_args.model_id, processor=processor, data_args=data_args
     )
 
     trainer = QwenSFTTrainer(
@@ -238,12 +357,14 @@ def train():
         **data_module,
     )
 
-    # 🔥 ADD DEBUG CALLBACK
+    # Logging callback (FIXED decode)
     trainer.add_callback(
-        PrintSampleCallback(
+        LogSampleCallback(
             processor=processor,
-            every_n_steps=training_args.logging_steps or 1,
+            every_n_steps=(training_args.logging_steps or 50),
             max_new_tokens=128,
+            save_path=os.path.join(training_args.output_dir, "train_predictions.jsonl"),
+            print_chars=400,
         )
     )
 
@@ -253,6 +374,7 @@ def train():
     trainer.save_state()
     model.config.use_cache = True
 
+    # Save
     if training_args.lora_enable:
         lora_state = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
@@ -261,7 +383,7 @@ def train():
             model.named_parameters(), require_grad_only=True
         )
 
-        if local_rank in (0, -1):
+        if local_rank in (0, -1, None, "0"):
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=lora_state)
             processor.save_pretrained(training_args.output_dir)
@@ -270,9 +392,7 @@ def train():
                 os.path.join(training_args.output_dir, "non_lora_state_dict.bin"),
             )
     else:
-        safe_save_model_for_hf_trainer(
-            trainer, output_dir=training_args.output_dir
-        )
+        safe_save_model_for_hf_trainer(trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

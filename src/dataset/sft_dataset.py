@@ -12,51 +12,78 @@ from src.constants import (
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IMAGE_TOKEN,
-    DEFAULT_VIDEO_TOKEN,
     SYSTEM_MESSAGE,
 )
 
-from .data_utils import get_image_info, get_video_info, llava_to_openai, pad_sequence
+from src.utils import get_image_info, llava_to_openai, pad_sequence
+
 
 class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
+    """
+    Dataset for image editing SFT:
+    Input  = image + critique
+    Output = list of editing actions
+    """
 
     def __init__(
         self,
-        data_path: str | list,
+        data_path: str,
         processor: transformers.ProcessorMixin,
         data_args: DataArguments,
         model_id,
         padding=True,
     ):
-        super(SupervisedDataset, self).__init__()
-        if isinstance(data_path, str):
-            list_data_dict = json.load(open(data_path, "r"))
-        else:
-            list_data_dict = data_path
+        super().__init__()
 
-        self.model_id = model_id
+        # ===== Load JSONL dataset =====
+        self.list_data_dict = []
+        with open(data_path, "r", encoding="utf-8") as f:
+            for line in f:
+
+                line = line.strip()
+
+                if not line:
+                    continue 
+
+                try:
+                    obj = json.loads(line)
+                except Exception as e:
+                    print("JSON parse error, skipping line:")
+                    print(line[:200])
+                    print(e)
+                    continue
+
+                # ---- Build LLaVA-style sample ----
+                human_prompt = (
+                    f"{DEFAULT_IMAGE_TOKEN}\n"
+                    f"Critique: {obj['Critique']}\n"
+                    "Task: Based on the critique, write clear step-by-step "
+                    "image editing actions to improve the image."
+                )
+
+                assistant_answer = obj["List of action"]
+
+                self.list_data_dict.append({
+                    "image": obj["Image_URL"],   # ONLY original image
+                    "conversations": [
+                        {"from": "human", "value": human_prompt},
+                        {"from": "gpt", "value": assistant_answer},
+                    ],
+                    "id": obj.get("ID", None),
+                })
+
         self.processor = processor
-        self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.model_id = model_id
         self.padding = padding
+
         self.image_min_pixel = data_args.image_min_pixels
         self.image_max_pixel = data_args.image_max_pixels
-        self.video_min_pixel = data_args.video_min_pixels
-        self.video_max_pixel = data_args.video_max_pixels
         self.image_resized_w = data_args.image_resized_width
         self.image_resized_h = data_args.image_resized_height
-        self.video_resized_w = data_args.video_resized_width
-        self.video_resized_h = data_args.video_resized_height
-        self.fps = data_args.fps
-        self.nframes = data_args.nframes
 
-        if "Qwen3" in self.model_id:
-            self.image_patch_size = 16
-            self.return_video_metadata = True
-        else:
-            self.image_patch_size = 14
-            self.return_video_metadata = False
+        # Qwen-VL patch size
+        self.image_patch_size = 16 if "Qwen3" in model_id else 14
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -64,275 +91,92 @@ class SupervisedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
 
-        is_video = False
+        # ===== Load image =====
+        image_file = sources["image"]
+        if not os.path.exists(image_file) and not image_file.startswith("http"):
+            image_file = os.path.join(self.data_args.image_folder, image_file)
 
-        processor = self.processor
-        if "image" in sources:
-            videos = None
-            grid_key = "image_grid_thw"
-            pixel_key = "pixel_values"
+        image_input = get_image_info(
+            image_file,
+            self.image_min_pixel,
+            self.image_max_pixel,
+            self.image_resized_w,
+            self.image_resized_h,
+            self.image_patch_size,
+        )
 
-            image_files = sources["image"]
-            image_folder = self.data_args.image_folder
-
-            if isinstance(image_files, str):
-                image_files = [image_files]
-
-            images = []
-
-            for image_file in image_files:
-                if not os.path.exists(image_file):
-                    if not image_file.startswith("http"):
-                        image_file = os.path.join(image_folder, image_file)
-                image_input = get_image_info(
-                        image_file, 
-                        self.image_min_pixel, 
-                        self.image_max_pixel, 
-                        self.image_resized_w, 
-                        self.image_resized_h, 
-                        self.image_patch_size
-                    )
-                images.append(image_input)
-
-        elif "video" in sources:
-            is_video = True
-            images=None
-            grid_key = "video_grid_thw"
-            pixel_key = "pixel_values_videos"
-
-            video_files = sources["video"]
-            video_folder = self.data_args.image_folder
-
-            if isinstance(video_files, str):
-                video_files = [video_files]
-
-            videos = []
-            for video_file in video_files:
-                if not os.path.exists(video_file):
-                    if not video_file.startswith("http"):
-                        video_file = os.path.join(video_folder, video_file)
-                video_input, video_kwargs = get_video_info(
-                    video_file, 
-                    self.video_min_pixel, 
-                    self.video_max_pixel, 
-                    self.video_resized_w, 
-                    self.video_resized_h, 
-                    self.data_args.fps,
-                    self.image_patch_size,
-                    return_video_metadata=self.return_video_metadata
-                )
-                videos.append(video_input)
-        else:
-            grid_key = None
-            pixel_key = None
-            images=None
-            videos=None
-
-        sources = copy.deepcopy(llava_to_openai(sources['conversations'], is_video=is_video))
+        # ===== Convert conversation format =====
+        sources = llava_to_openai(sources["conversations"], is_video=False)
 
         all_input_ids = []
         all_labels = []
         all_pixel_values = []
         all_image_grid_thw = []
-        all_second_gird = []
 
-        image_curr_count = 0
-        video_curr_count = 0
-        
-        # Qwen2-VL uses a default system message so I've added this.
-        # Qwen3-Vl does not use a system message by default.
+        # ===== Optional system message =====
         if len(SYSTEM_MESSAGE) > 0 and "Qwen3" not in self.model_id:
-            system_message = f"{DEFAULT_IM_START_TOKEN}system\n{SYSTEM_MESSAGE}{DEFAULT_IM_END_TOKEN}\n"
-            system_message_input_ids = processor.tokenizer(system_message, add_special_tokens=False, return_tensors='pt')['input_ids']
-            system_labels = torch.full_like(system_message_input_ids, IGNORE_INDEX)
-
-            all_input_ids.append(system_message_input_ids.squeeze(0))
-            all_labels.append(system_labels.squeeze(0))
-
-        for _, j in enumerate(range(0, len(sources), 2)):
-            user_input = sources[j]
-            gpt_response = sources[j + 1]
-
-            user_input = f"{DEFAULT_IM_START_TOKEN}{user_input['role']}\n{user_input['content']}{DEFAULT_IM_END_TOKEN}\n{DEFAULT_IM_START_TOKEN}{gpt_response['role']}\n"
-            gpt_response = f"{gpt_response['content']}{DEFAULT_IM_END_TOKEN}\n"
-
-            if DEFAULT_IMAGE_TOKEN in user_input:
-                num_images = user_input.count(DEFAULT_IMAGE_TOKEN)
-                # Slice the images list to get the images for the current turn.
-                images_for_this_turn = images[image_curr_count : image_curr_count + num_images]
-                inputs = processor(text=[user_input], images=images_for_this_turn, videos=videos, padding=False, do_resize=False, return_tensors='pt')
-                prompt_input_ids = inputs['input_ids']
-                all_pixel_values.append(inputs[pixel_key])
-                all_image_grid_thw.append(inputs[grid_key])
-                image_curr_count += num_images
-
-            elif DEFAULT_VIDEO_TOKEN in user_input:
-                num_videos = user_input.count(DEFAULT_VIDEO_TOKEN)
-                # Slice the videos list to get the videos for the current turn.
-                videos_for_this_turn = videos[video_curr_count : video_curr_count + num_videos]
-                if "Qwen2.5" in self.model_id:
-                    inputs = processor(
-                        text=[user_input], 
-                        images=images, 
-                        videos=videos_for_this_turn, 
-                        padding=False, 
-                        do_resize=False, 
-                        return_tensors='pt', 
-                        **video_kwargs
-                    )
-                    all_second_gird.extend(inputs["second_per_grid_ts"])
-                elif "Qwen3" in self.model_id:
-
-                    videos_for_this_turn = videos[video_curr_count : video_curr_count + num_videos]
-                    video_datas_for_turn, video_metadatas_for_turn = zip(*videos_for_this_turn)
-                    video_datas_for_turn = list(video_datas_for_turn)
-                    video_metadatas_for_turn = list(video_metadatas_for_turn)
-
-                    inputs = processor(
-                        text=[user_input],
-                        images=images,
-                        videos=video_datas_for_turn,
-                        padding=False,
-                        do_resize=False,
-                        return_tensors='pt',
-                        **video_kwargs,
-                        video_metadata=video_metadatas_for_turn,
-                    )
-                else:
-                    inputs = processor(
-                        text=[user_input], 
-                        images=images, 
-                        videos=videos_for_this_turn, 
-                        padding=False, 
-                        do_resize=False, 
-                        return_tensors='pt'
-                    )
-                prompt_input_ids = inputs['input_ids']
-                all_pixel_values.append(inputs[pixel_key])
-                all_image_grid_thw.append(inputs[grid_key])
-                video_curr_count += num_videos
-
-            else:
-                prompt_input_ids = processor.tokenizer(user_input, add_special_tokens=False, padding=False, return_tensors='pt')['input_ids']
-
-            response_input_ids = processor.tokenizer(gpt_response, add_special_tokens=False, padding=False, return_tensors='pt')['input_ids']
-
-            input_ids = torch.cat([prompt_input_ids, response_input_ids], dim=1).squeeze(0)
-            labels = torch.cat(
-                [
-                    torch.tensor([IGNORE_INDEX] * len(prompt_input_ids[0])),
-                    response_input_ids.squeeze(0),
-                ],
-                dim=0,
+            system_message = (
+                f"{DEFAULT_IM_START_TOKEN}system\n"
+                f"{SYSTEM_MESSAGE}"
+                f"{DEFAULT_IM_END_TOKEN}\n"
             )
+            system_ids = self.processor.tokenizer(
+                system_message, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"]
 
-            all_input_ids.append(input_ids)
-            all_labels.append(labels)
+            all_input_ids.append(system_ids.squeeze(0))
+            all_labels.append(torch.full_like(system_ids.squeeze(0), IGNORE_INDEX))
 
-        # There is no need for eos or bos tokens in the input_ids
-        # Qwen2-VL does not use them
-        input_ids = torch.cat(all_input_ids, dim=0).to(torch.long)
-        labels = torch.cat(all_labels, dim=0).to(torch.long)
+        # ===== Single-turn conversation =====
+        user_input = sources[0]
+        gpt_response = sources[1]
 
-        # eos_token_id = processor.tokenizer.convert_tokens_to_ids(DEFAULT_IM_END_TOKEN)
-        # input_ids, labels = truncate_sequence(input_ids, labels, self.max_length, eos_token_id)
-
-        attention_mask = (input_ids > -1000000).to(torch.long)
-
-        data_dict = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
+        user_text = (
+            f"{DEFAULT_IM_START_TOKEN}{user_input['role']}\n"
+            f"{user_input['content']}"
+            f"{DEFAULT_IM_END_TOKEN}\n"
+            f"{DEFAULT_IM_START_TOKEN}{gpt_response['role']}\n"
         )
 
-        if pixel_key and grid_key:
-            pixel_values = torch.cat(all_pixel_values, dim=0)
-            image_thw = torch.cat(all_image_grid_thw, dim=0)
-            data_dict[pixel_key] = pixel_values
-            data_dict[grid_key] = image_thw
+        assistant_text = f"{gpt_response['content']}{DEFAULT_IM_END_TOKEN}\n"
 
-        if len(all_second_gird) > 0:
-            second_gird = all_second_gird
-            data_dict["second_per_grid_ts"] = second_gird
-
-        return data_dict
-
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
-    def __init__(self, pad_token_id: int):
-        self.pad_token_id = pad_token_id
-
-    def __call__(self, examples):
-        batch_input_ids = []
-        batch_label_ids = []
-        batch_pixel_values = []
-        batch_pixel_video_values = []
-        batch_video_thw = []
-        batch_image_thw = []
-        batch_second_per_grid_ts = []
-
-        for example in examples:
-            keys = example.keys()
-            if "pixel_values_videos" in keys:
-                batch_pixel_video_values.append(example["pixel_values_videos"])
-                batch_video_thw.append(example["video_grid_thw"])
-            elif "pixel_values" in keys:
-                batch_pixel_values.append(example["pixel_values"])
-                batch_image_thw.append(example["image_grid_thw"])
-
-            batch_input_ids.append(example["input_ids"])
-            batch_label_ids.append(example["labels"])
-
-            if "second_per_grid_ts" in keys:
-                batch_second_per_grid_ts.extend(example["second_per_grid_ts"])
-
-        input_ids = pad_sequence(
-            batch_input_ids, padding_side='right', padding_value=self.pad_token_id
+        # Encode image + prompt
+        inputs = self.processor(
+            text=[user_text],
+            images=[image_input],
+            padding=False,
+            do_resize=False,
+            return_tensors="pt",
         )
 
-        attention_mask = input_ids != self.pad_token_id
-        labels = pad_sequence(batch_label_ids, padding_side='right', padding_value=IGNORE_INDEX)
+        prompt_ids = inputs["input_ids"]
+        response_ids = self.processor.tokenizer(
+            assistant_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"]
+
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1).squeeze(0)
+        labels = torch.cat(
+            [
+                torch.full((prompt_ids.size(1),), IGNORE_INDEX),
+                response_ids.squeeze(0),
+            ],
+            dim=0,
+        )
+
+        all_input_ids.append(input_ids)
+        all_labels.append(labels)
+
+        input_ids = torch.cat(all_input_ids)
+        labels = torch.cat(all_labels)
+
+        attention_mask = input_ids != self.processor.tokenizer.pad_token_id
 
         data_dict = {
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask,
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "pixel_values": inputs["pixel_values"],
+            "image_grid_thw": inputs["image_grid_thw"],
         }
 
-        if len(batch_pixel_values) > 0:
-            pixel_values = torch.cat(batch_pixel_values, dim=0)
-            image_thw = torch.cat(batch_image_thw, dim=0)
-            data_dict["pixel_values"] = pixel_values
-            data_dict["image_grid_thw"] = image_thw
-
-        if len(batch_pixel_video_values) > 0:
-            pixel_video_values = torch.cat(batch_pixel_video_values, dim=0)
-            video_thw = torch.cat(batch_video_thw, dim=0)
-            data_dict["pixel_values_videos"] = pixel_video_values
-            data_dict["video_grid_thw"] = video_thw
-
-        if len(batch_second_per_grid_ts) > 0:
-            data_dict["second_per_grid_ts"] = batch_second_per_grid_ts
-
         return data_dict
-
-def make_supervised_data_module(model_id, processor, data_args):
-    """Make dataset and collator for supervised fine-tuning."""
-    sft_dataset = SupervisedDataset(
-        data_path=data_args.data_path, processor=processor, data_args=data_args, model_id=model_id
-    )
-    eval_dataset = None
-    if data_args.eval_path is not None:
-        eval_dataset = SupervisedDataset(
-              data_path=data_args.eval_path,
-              processor=processor,
-              data_args=data_args,
-              model_id=model_id
-          )
-        
-    data_collator = DataCollatorForSupervisedDataset(pad_token_id=processor.tokenizer.pad_token_id)
-
-    return dict(train_dataset=sft_dataset,
-                eval_dataset=eval_dataset,
-                data_collator=data_collator)
