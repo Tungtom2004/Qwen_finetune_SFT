@@ -329,20 +329,27 @@ def train():
 
     # LoRA
     if training_args.lora_enable:
-        exclude = ast.literal_eval(training_args.lora_namespan_exclude) if training_args.lora_namespan_exclude else []
-        exclude += ["visual"]
+        LORA_LAYER_INDEX = int(os.environ("LORA_LAYER_INDEX", 31))
+        target_modules = ["q_proj","v_proj"]
 
         lora_cfg = LoraConfig(
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
-            target_modules=find_lora_targets(
-                model, exclude=exclude, max_modules=training_args.num_lora_modules
-            ),
+
+            target_modules=target_modules,
+            layers_to_transform=[LORA_LAYER_INDEX],
+            layers_pattern="layers",
+
+            # đảm bảo KHÔNG dính vision
+            exclude_modules=".*visual.*",
         )
+
         model = get_peft_model(model, lora_cfg)
-        rank0_print("LoRA enabled")
+        rank0_print(
+            f"[LoRA] Enabled on layer={LORA_LAYER_INDEX}, targets={target_modules}"
+        )
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
