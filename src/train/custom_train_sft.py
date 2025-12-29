@@ -98,6 +98,7 @@ def batch_to_device_and_fix(
 ) -> Dict[str, Any]:
     """
     Move tensors to GPU + fix shapes for Qwen-VL forward.
+    Keep non-tensor metadata (strings/ints/lists) as-is.
     """
     out: Dict[str, Any] = {}
     for k, v in batch.items():
@@ -122,14 +123,16 @@ def batch_to_device_and_fix(
 
 
 # =========================================================
-# Debug + Logging callback: print + save jsonl
+# Debug + Logging callback: print + save jsonl (NO GOLDEN)
 # =========================================================
 
 class LogSampleCallback(TrainerCallback):
     """
-    Correct SFT logging:
-      - generate ONLY from prompt (no golden leakage)
+    SFT logging (no leakage):
+      - generate ONLY from prompt
       - decode ONLY newly generated tokens
+      - log sample_id/post_id/reviewer_id/image_url for tracing
+      - DO NOT log golden/labels
     """
 
     def __init__(
@@ -150,6 +153,15 @@ class LogSampleCallback(TrainerCallback):
         if not os.path.exists(save_path):
             open(save_path, "w", encoding="utf-8").close()
 
+    @staticmethod
+    def _first_of(x):
+        # batch metadata thường là list[str] / list[int] / scalar
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)):
+            return x[0] if len(x) > 0 else None
+        return x
+
     @torch.no_grad()
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step == 0 or state.global_step % self.every_n_steps != 0:
@@ -166,7 +178,13 @@ class LogSampleCallback(TrainerCallback):
         raw_batch = next(iter(train_dataloader))
         batch = batch_to_device_and_fix(raw_batch, model_device=model.device)
 
-        # 2) compute prompt_len CORRECTLY
+        # ---- extract metadata for tracing ----
+        sample_id = self._first_of(batch.get("sample_id"))
+        post_id = self._first_of(batch.get("post_id"))
+        reviewer_id = self._first_of(batch.get("reviewer_id"))
+        image_url = self._first_of(batch.get("image_url"))
+
+        # 2) compute prompt_len from labels IGNORE_INDEX
         labels = batch["labels"]
         IGNORE_INDEX = -100
         prompt_len = int((labels[0] == IGNORE_INDEX).sum().item())
@@ -196,22 +214,22 @@ class LogSampleCallback(TrainerCallback):
         if pred_text == "":
             pred_text = "[EMPTY_GENERATION]"
 
-        # 5) decode golden (label part)
-        label_ids = labels.detach().clone().cpu()
-        label_ids[label_ids < 0] = self.processor.tokenizer.pad_token_id
-        label_ids = ensure_ids_2d(label_ids, device=None)
-
-        golden_text = self.processor.tokenizer.batch_decode(
-            label_ids, skip_special_tokens=True
-        )[0].strip()
-
         record = {
             "time": datetime.now().isoformat(),
             "global_step": int(state.global_step),
+
+            # tracing fields
+            "sample_id": sample_id,
+            "post_id": post_id,
+            "reviewer_id": reviewer_id,
+            "image_url": image_url,
+
+            # prediction
             "prediction": pred_text,
-            "golden": golden_text,
+
+            # debug info
             "prompt_len": prompt_len,
-            "gen_new_tokens": gen_only.shape[1],
+            "gen_new_tokens": int(gen_only.shape[1]),
         }
 
         with open(self.save_path, "a", encoding="utf-8") as f:
@@ -219,14 +237,13 @@ class LogSampleCallback(TrainerCallback):
 
         print("\n" + "=" * 90)
         print(f"[STEP {state.global_step}] saved -> {self.save_path}")
-        print(f"prompt_len={prompt_len} | gen_new_tokens={gen_only.shape[1]}")
+        print(f"sample_id={sample_id} | post_id={post_id} | reviewer_id={reviewer_id}")
+        print(f"image_url={image_url}")
+        print(f"prompt_len={prompt_len} | gen_new_tokens={int(gen_only.shape[1])}")
         print("PRED:", pred_text[: self.print_chars])
-        print("-" * 90)
-        print("GT  :", golden_text[: self.print_chars])
         print("=" * 90 + "\n")
 
         model.train()
-
 
 
 # =========================================================
@@ -327,10 +344,13 @@ def train():
     set_requires_grad(model.lm_head.parameters(), not training_args.freeze_llm)
     set_requires_grad(model.visual.parameters(), not training_args.freeze_vision_tower)
 
-    # LoRA
+    # =========================
+    # LoRA: ONLY 1 LAYER
+    # =========================
     if training_args.lora_enable:
-        LORA_LAYER_INDEX = int(os.environ("LORA_LAYER_INDEX", 31))
-        target_modules = ["q_proj","v_proj"]
+        # FIX: os.environ.get, not os.environ(...)
+        LORA_LAYER_INDEX = int(os.environ.get("LORA_LAYER_INDEX", "31"))
+        target_modules = ["q_proj", "v_proj"]
 
         lora_cfg = LoraConfig(
             r=training_args.lora_rank,
@@ -341,15 +361,11 @@ def train():
             target_modules=target_modules,
             layers_to_transform=[LORA_LAYER_INDEX],
             layers_pattern="layers",
-
-            # đảm bảo KHÔNG dính vision
             exclude_modules=".*visual.*",
         )
 
         model = get_peft_model(model, lora_cfg)
-        rank0_print(
-            f"[LoRA] Enabled on layer={LORA_LAYER_INDEX}, targets={target_modules}"
-        )
+        rank0_print(f"[LoRA] Enabled on layer={LORA_LAYER_INDEX}, targets={target_modules}")
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
@@ -364,7 +380,6 @@ def train():
         **data_module,
     )
 
-    # Logging callback (FIXED decode)
     trainer.add_callback(
         LogSampleCallback(
             processor=processor,
