@@ -212,7 +212,7 @@ if __name__ == "__main__":
     pred_img = Image.open("/disk/yuu/Qwen_finetune_SFT/8a4115ba98bcd8b2__odq5gt_sim_0.8009999990463257_2.jpg").convert("RGB")
     gt_img = Image.open("/disk/yuu/Qwen_finetune_SFT/odq5gt_output_google_nano_banana_reviewer2.png").convert("RGB")
 
-    instruction = "The photo has a good idea working for it. The open, vast landscape with the road pointing towards it is pushing the viewer's attention to go out and experience the great outdoors. However, placing the bridge and the road off-center somehow defeats the idea. Placing the road and the bridge in the center of the frame would solve the issue. Stepping back a bit to still include the signpost on the left side is ideal and would complete the image."
+    instruction = "Action 1: Place the road and the bridge in the center of the frame. Action 2: Step back to include the signpost on the left side."
 
     to_tensor = transforms.ToTensor()
     I_pred = to_tensor(pred_img).unsqueeze(0)
