@@ -74,8 +74,24 @@ def ensure_grid_thw(grid: Any, device: Optional[torch.device] = None) -> torch.T
     return g
 
 
+<<<<<<< HEAD
 def batch_to_device_and_fix(batch: Dict[str, Any], device: torch.device):
     out = {}
+=======
+def ensure_pixel_values(pv: Any, device: Optional[torch.device] = None) -> torch.Tensor:
+    return _to_tensor(pv, device=device)
+
+
+def batch_to_device_and_fix(
+    batch: Dict[str, Any],
+    model_device: torch.device,
+) -> Dict[str, Any]:
+    """
+    Move tensors to GPU + fix shapes for Qwen-VL forward.
+    Keep non-tensor metadata (strings/ints/lists) as-is.
+    """
+    out: Dict[str, Any] = {}
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
     for k, v in batch.items():
         out[k] = v.to(device) if isinstance(v, torch.Tensor) else v
 
@@ -89,10 +105,25 @@ def batch_to_device_and_fix(batch: Dict[str, Any], device: torch.device):
 
 
 # =========================================================
+<<<<<<< HEAD
 # Logging callback (memory-safe)
 # =========================================================
 
 class LogSampleCallback(TrainerCallback):
+=======
+# Debug + Logging callback: print + save jsonl (NO GOLDEN)
+# =========================================================
+
+class LogSampleCallback(TrainerCallback):
+    """
+    SFT logging (no leakage):
+      - generate ONLY from prompt
+      - decode ONLY newly generated tokens
+      - log sample_id/post_id/reviewer_id/image_url for tracing
+      - DO NOT log golden/labels
+    """
+
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
     def __init__(
         self,
         processor,
@@ -117,6 +148,15 @@ class LogSampleCallback(TrainerCallback):
             return x[0]
         return x
 
+    @staticmethod
+    def _first_of(x):
+        # batch metadata thường là list[str] / list[int] / scalar
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)):
+            return x[0] if len(x) > 0 else None
+        return x
+
     @torch.no_grad()
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step == 0 or state.global_step % self.every_n_steps != 0:
@@ -129,6 +169,20 @@ class LogSampleCallback(TrainerCallback):
         batch = next(iter(loader))
         batch = batch_to_device_and_fix(batch, model.device)
 
+<<<<<<< HEAD
+=======
+        # 1) get batch
+        raw_batch = next(iter(train_dataloader))
+        batch = batch_to_device_and_fix(raw_batch, model_device=model.device)
+
+        # ---- extract metadata for tracing ----
+        sample_id = self._first_of(batch.get("sample_id"))
+        post_id = self._first_of(batch.get("post_id"))
+        reviewer_id = self._first_of(batch.get("reviewer_id"))
+        image_url = self._first_of(batch.get("image_url"))
+
+        # 2) compute prompt_len from labels IGNORE_INDEX
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
         labels = batch["labels"]
         prompt_len = int((labels[0] == -100).sum().item())
 
@@ -153,6 +207,7 @@ class LogSampleCallback(TrainerCallback):
                 use_cache=False,
             )
 
+<<<<<<< HEAD
         gen = ensure_ids_2d(gen)
         pred = self.processor.tokenizer.decode(
             gen[0, prompt_ids.shape[1]:], skip_special_tokens=True
@@ -165,15 +220,51 @@ class LogSampleCallback(TrainerCallback):
             "reviewer_id": self._first(batch.get("reviewer_id")),
             "image_url": self._first(batch.get("image_url")),
             "prediction": pred,
+=======
+        # 4) decode generated part ONLY
+        gen_only = gen_ids[:, prompt_ids.shape[1]:]
+        pred_text = self.processor.tokenizer.batch_decode(
+            gen_only, skip_special_tokens=True
+        )[0].strip()
+
+        if pred_text == "":
+            pred_text = "[EMPTY_GENERATION]"
+
+        record = {
+            "time": datetime.now().isoformat(),
+            "global_step": int(state.global_step),
+
+            # tracing fields
+            "sample_id": sample_id,
+            "post_id": post_id,
+            "reviewer_id": reviewer_id,
+            "image_url": image_url,
+
+            # prediction
+            "prediction": pred_text,
+
+            # debug info
+            "prompt_len": prompt_len,
+            "gen_new_tokens": int(gen_only.shape[1]),
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
         }
 
         with open(self.save_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         print("\n" + "=" * 90)
+<<<<<<< HEAD
         print(f"[STEP {state.global_step}]")
         print("PRED:", pred[: self.print_chars])
         print("=" * 90)
+=======
+        print(f"[STEP {state.global_step}] saved -> {self.save_path}")
+        print(f"sample_id={sample_id} | post_id={post_id} | reviewer_id={reviewer_id}")
+        print(f"image_url={image_url}")
+        print(f"prompt_len={prompt_len} | gen_new_tokens={int(gen_only.shape[1])}")
+        print("PRED:", pred_text[: self.print_chars])
+        print("=" * 90 + "\n")
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
 
         del gen, prompt_ids, attn
         torch.cuda.empty_cache()
@@ -238,6 +329,7 @@ def train():
     model.config.use_cache = False
     model.gradient_checkpointing_enable()  # 🔥 critical
 
+<<<<<<< HEAD
     if training_args.lora_enable:
         lora = LoraConfig(
             r=training_args.lora_rank,
@@ -250,6 +342,35 @@ def train():
             model,
             int(os.environ.get("LORA_LAST_LAYER", "-1")),
         )
+=======
+    # Freeze / unfreeze
+    set_requires_grad(model.language_model.parameters(), not training_args.freeze_llm)
+    set_requires_grad(model.lm_head.parameters(), not training_args.freeze_llm)
+    set_requires_grad(model.visual.parameters(), not training_args.freeze_vision_tower)
+
+    # =========================
+    # LoRA: ONLY 1 LAYER
+    # =========================
+    if training_args.lora_enable:
+        # FIX: os.environ.get, not os.environ(...)
+        LORA_LAYER_INDEX = int(os.environ.get("LORA_LAYER_INDEX", "31"))
+        target_modules = ["q_proj", "v_proj"]
+
+        lora_cfg = LoraConfig(
+            r=training_args.lora_rank,
+            lora_alpha=training_args.lora_alpha,
+            lora_dropout=training_args.lora_dropout,
+            bias=training_args.lora_bias,
+
+            target_modules=target_modules,
+            layers_to_transform=[LORA_LAYER_INDEX],
+            layers_pattern="layers",
+            exclude_modules=".*visual.*",
+        )
+
+        model = get_peft_model(model, lora_cfg)
+        rank0_print(f"[LoRA] Enabled on layer={LORA_LAYER_INDEX}, targets={target_modules}")
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 

@@ -44,9 +44,14 @@ class SupervisedDataset(Dataset):
     Output : list of editing actions (text)
 
     NOTE:
+<<<<<<< HEAD
       - Dataset KHÔNG truncate
       - max_seq_length do Trainer + collator xử lý
       - metadata chỉ dùng cho logging
+=======
+      - input_ids / labels: dùng cho training
+      - metadata fields   : CHỈ dùng cho logging / tracing
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
     """
 
     def __init__(
@@ -88,12 +93,20 @@ class SupervisedDataset(Dataset):
                 assistant_answer = obj["List of action"]
 
                 self.samples.append({
+<<<<<<< HEAD
                     # --- identifiers ---
+=======
+                    # ===== identifiers =====
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
                     "id": obj.get("ID", f"line_{line_idx}"),
                     "Post_ID": obj.get("Post_ID"),
                     "Reviewer_ID": obj.get("ReviewerID"),
 
+<<<<<<< HEAD
                     # --- data ---
+=======
+                    # ===== data =====
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
                     "image": obj["Image_URL"],
                     "conversations": [
                         {"from": "human", "value": human_prompt},
@@ -118,7 +131,7 @@ class SupervisedDataset(Dataset):
 
         image = load_image(image_path)
 
-        # ===== Convert conversation =====
+        # ===== Convert conversation to OpenAI-style =====
         conv = llava_to_openai(sample["conversations"], is_video=False)
         user_msg, gpt_msg = conv
 
@@ -138,18 +151,28 @@ class SupervisedDataset(Dataset):
             return_tensors="pt",
         )
 
+<<<<<<< HEAD
         prompt_ids = inputs["input_ids"]          # (1, Lp)
         pixel_values = inputs["pixel_values"]
         image_grid_thw = inputs["image_grid_thw"]
+=======
+        prompt_ids = inputs["input_ids"]              # (1, Lp)
+        pixel_values = inputs["pixel_values"]         # (N, C)
+        image_grid_thw = inputs["image_grid_thw"]     # (1, 3)
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
 
         # ===== Encode response =====
         response_ids = self.processor.tokenizer(
             assistant_text,
             add_special_tokens=False,
             return_tensors="pt",
-        )["input_ids"]                            # (1, Lr)
+        )["input_ids"]                                # (1, Lr)
 
+<<<<<<< HEAD
         # ===== Build final tensors (NO truncate here) =====
+=======
+        # ===== Build final tensors =====
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
         input_ids = torch.cat([prompt_ids, response_ids], dim=1).squeeze(0)
 
         labels = torch.cat(
@@ -162,6 +185,8 @@ class SupervisedDataset(Dataset):
 
         attention_mask = input_ids != self.processor.tokenizer.pad_token_id
 
+        # ===== RETURN =====
+        # NOTE: metadata fields are NOT tensors → safe for Trainer
         return {
             # --- training ---
             "input_ids": input_ids,
@@ -170,7 +195,11 @@ class SupervisedDataset(Dataset):
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
 
+<<<<<<< HEAD
             # --- metadata (logging only) ---
+=======
+            # --- metadata (for logging / tracing only) ---
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
             "sample_id": sample["id"],
             "post_id": sample["Post_ID"],
             "reviewer_id": sample["Reviewer_ID"],
@@ -201,5 +230,9 @@ def make_supervised_data_module(model_id, processor, data_args):
     return {
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
+<<<<<<< HEAD
         "data_collator": QwenVLDataCollator(),
+=======
+        "data_collator": QwenVLDataCollator(),  # unchanged
+>>>>>>> d42941fdf55ec6678377e656572e15e4b70780be
     }
