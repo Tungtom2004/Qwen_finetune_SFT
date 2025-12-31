@@ -104,6 +104,11 @@ class CLSArguments(HFTrainingArguments):
 
 @dataclass
 class TrainingArguments(HFTrainingArguments):
+
+    remove_unused_columns: bool = field(
+        default=False,
+        metadata={"help": "Do not drop extra columns (sample_id, post_id, image_url, ...)."}
+    )
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     adam_beta1: float = field(default=0.9)

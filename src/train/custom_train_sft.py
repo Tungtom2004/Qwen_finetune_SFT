@@ -4,7 +4,7 @@ import json
 import pathlib
 from datetime import datetime
 from typing import Any, Dict, Optional
-
+import re
 import torch
 from transformers import (
     AutoProcessor,
@@ -39,7 +39,7 @@ from src.train.monkey_patch_vision import replace_qwen2_5_vision
 
 
 # =========================================================
-# Helpers: make shapes safe for Qwen-VL
+# Helpers
 # =========================================================
 
 def _to_tensor(x: Any, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -53,301 +53,208 @@ def _to_tensor(x: Any, device: Optional[torch.device] = None) -> torch.Tensor:
 
 
 def ensure_ids_2d(ids: Any, device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Force token ids into shape (B, L).
-    Supports: tensor/list, (L,), (B,L), (B, num_return, L), etc.
-    """
     ids = _to_tensor(ids, device=device)
-
     if ids.ndim == 1:
-        ids = ids.unsqueeze(0)  # (1, L)
+        ids = ids.unsqueeze(0)
     elif ids.ndim == 3:
-        # common from generate: (B, num_return, L)
-        ids = ids[:, 0, :]      # take first
+        ids = ids[:, 0, :]
     elif ids.ndim > 3:
         ids = ids.reshape(ids.shape[0], -1)
     return ids
 
 
 def ensure_grid_thw(grid: Any, device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Qwen2-VL expects image_grid_thw with shape (B, 3).
-    Fix common broken cases:
-      - (3,) -> (1,3)
-      - (B,1,3) -> (B,3)
-    """
     g = _to_tensor(grid, device=device).long()
-
     if g.ndim == 1:
-        g = g.unsqueeze(0)  # (1,3)
-    elif g.ndim == 3 and g.shape[1] == 1 and g.shape[2] == 3:
-        g = g.squeeze(1)    # (B,3)
-
+        g = g.unsqueeze(0)
+    elif g.ndim == 3 and g.shape[1] == 1:
+        g = g.squeeze(1)
     if g.ndim != 2 or g.shape[1] != 3:
-        raise ValueError(f"[FATAL] image_grid_thw must be (B,3). Got {tuple(g.shape)}")
+        raise ValueError(f"Bad image_grid_thw shape: {g.shape}")
     return g
 
 
-def ensure_pixel_values(pv: Any, device: Optional[torch.device] = None) -> torch.Tensor:
-    return _to_tensor(pv, device=device)
-
-
-def batch_to_device_and_fix(
-    batch: Dict[str, Any],
-    model_device: torch.device,
-) -> Dict[str, Any]:
-    """
-    Move tensors to GPU + fix shapes for Qwen-VL forward.
-    """
-    out: Dict[str, Any] = {}
+def batch_to_device_and_fix(batch: Dict[str, Any], device: torch.device):
+    out = {}
     for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(model_device)
-        else:
-            out[k] = v
+        out[k] = v.to(device) if isinstance(v, torch.Tensor) else v
 
-    if "image_grid_thw" in out and out["image_grid_thw"] is not None:
-        out["image_grid_thw"] = ensure_grid_thw(out["image_grid_thw"], device=model_device)
-
-    if "pixel_values" in out and out["pixel_values"] is not None:
-        out["pixel_values"] = ensure_pixel_values(out["pixel_values"], device=model_device)
-
-    if "input_ids" in out and out["input_ids"] is not None:
-        out["input_ids"] = ensure_ids_2d(out["input_ids"], device=model_device)
-
-    if "attention_mask" in out and out["attention_mask"] is not None:
-        out["attention_mask"] = ensure_ids_2d(out["attention_mask"], device=model_device)
-
+    if "input_ids" in out:
+        out["input_ids"] = ensure_ids_2d(out["input_ids"], device)
+    if "attention_mask" in out:
+        out["attention_mask"] = ensure_ids_2d(out["attention_mask"], device)
+    if "image_grid_thw" in out:
+        out["image_grid_thw"] = ensure_grid_thw(out["image_grid_thw"], device)
     return out
 
 
 # =========================================================
-# Debug + Logging callback: print + save jsonl
+# Logging callback (memory-safe)
 # =========================================================
 
 class LogSampleCallback(TrainerCallback):
-    """
-    Correct SFT logging:
-      - generate ONLY from prompt (no golden leakage)
-      - decode ONLY newly generated tokens
-    """
-
     def __init__(
         self,
         processor,
-        every_n_steps: int = 50,
-        max_new_tokens: int = 128,
-        save_path: str = "outputs/train_predictions.jsonl",
-        print_chars: int = 400,
+        every_n_steps=50,
+        max_new_tokens=128,
+        save_path="outputs/train_predictions.jsonl",
+        print_chars=400,
     ):
         self.processor = processor
-        self.every_n_steps = max(1, int(every_n_steps))
-        self.max_new_tokens = int(max_new_tokens)
+        self.every_n_steps = every_n_steps
+        self.max_new_tokens = max_new_tokens
         self.save_path = save_path
-        self.print_chars = int(print_chars)
+        self.print_chars = print_chars
 
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         if not os.path.exists(save_path):
-            open(save_path, "w", encoding="utf-8").close()
+            open(save_path, "w").close()
+
+    @staticmethod
+    def _first(x):
+        if isinstance(x, list):
+            return x[0]
+        return x
 
     @torch.no_grad()
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step == 0 or state.global_step % self.every_n_steps != 0:
             return
 
-        model = kwargs.get("model")
-        train_dataloader = kwargs.get("train_dataloader")
-        if model is None or train_dataloader is None:
-            return
+        model = kwargs["model"]
+        loader = kwargs["train_dataloader"]
 
         model.eval()
+        batch = next(iter(loader))
+        batch = batch_to_device_and_fix(batch, model.device)
 
-        # 1) get batch
-        raw_batch = next(iter(train_dataloader))
-        batch = batch_to_device_and_fix(raw_batch, model_device=model.device)
-
-        # 2) compute prompt_len CORRECTLY
         labels = batch["labels"]
-        IGNORE_INDEX = -100
-        prompt_len = int((labels[0] == IGNORE_INDEX).sum().item())
+        prompt_len = int((labels[0] == -100).sum().item())
 
-        prompt_ids = batch["input_ids"][:, :prompt_len]
-        prompt_attention = batch["attention_mask"][:, :prompt_len]
+        prompt_ids = batch["input_ids"][:1, :prompt_len]
+        attn = batch["attention_mask"][:1, :prompt_len]
 
-        # 3) generate from PROMPT ONLY
-        gen_ids = model.generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_attention,
-            pixel_values=batch.get("pixel_values"),
-            image_grid_thw=batch.get("image_grid_thw"),
-            max_new_tokens=self.max_new_tokens,
-            do_sample=False,
-            num_return_sequences=1,
-        )
+        pixel = batch.get("pixel_values")
+        grid = batch.get("image_grid_thw")
+        if pixel is not None:
+            pixel = pixel[:1]
+        if grid is not None:
+            grid = grid[:1]
 
-        gen_ids = ensure_ids_2d(gen_ids, device=None)
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            gen = model.generate(
+                input_ids=prompt_ids,
+                attention_mask=attn,
+                pixel_values=pixel,
+                image_grid_thw=grid,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                use_cache=False,
+            )
 
-        # 4) decode generated part ONLY
-        gen_only = gen_ids[:, prompt_ids.shape[1]:]
-        pred_text = self.processor.tokenizer.batch_decode(
-            gen_only, skip_special_tokens=True
-        )[0].strip()
-
-        if pred_text == "":
-            pred_text = "[EMPTY_GENERATION]"
-
-        # 5) decode golden (label part)
-        label_ids = labels.detach().clone().cpu()
-        label_ids[label_ids < 0] = self.processor.tokenizer.pad_token_id
-        label_ids = ensure_ids_2d(label_ids, device=None)
-
-        golden_text = self.processor.tokenizer.batch_decode(
-            label_ids, skip_special_tokens=True
-        )[0].strip()
+        gen = ensure_ids_2d(gen)
+        pred = self.processor.tokenizer.decode(
+            gen[0, prompt_ids.shape[1]:], skip_special_tokens=True
+        ).strip()
 
         record = {
-            "time": datetime.now().isoformat(),
-            "global_step": int(state.global_step),
-            "prediction": pred_text,
-            "golden": golden_text,
-            "prompt_len": prompt_len,
-            "gen_new_tokens": gen_only.shape[1],
+            "step": int(state.global_step),
+            "sample_id": self._first(batch.get("sample_id")),
+            "post_id": self._first(batch.get("post_id")),
+            "reviewer_id": self._first(batch.get("reviewer_id")),
+            "image_url": self._first(batch.get("image_url")),
+            "prediction": pred,
         }
 
         with open(self.save_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         print("\n" + "=" * 90)
-        print(f"[STEP {state.global_step}] saved -> {self.save_path}")
-        print(f"prompt_len={prompt_len} | gen_new_tokens={gen_only.shape[1]}")
-        print("PRED:", pred_text[: self.print_chars])
-        print("-" * 90)
-        print("GT  :", golden_text[: self.print_chars])
-        print("=" * 90 + "\n")
+        print(f"[STEP {state.global_step}]")
+        print("PRED:", pred[: self.print_chars])
+        print("=" * 90)
 
+        del gen, prompt_ids, attn
+        torch.cuda.empty_cache()
         model.train()
 
 
-
 # =========================================================
-# Utils
+# Enable last-layer LoRA only
 # =========================================================
 
-local_rank = None
+def enable_only_last_layer_lora(model, last_layer=-1):
+    layer_re = re.compile(r"\.language_model\.layers\.(\d+)\.")
+    layers = set()
 
+    for n, p in model.named_parameters():
+        if "lora_" in n:
+            m = layer_re.search(n)
+            if m:
+                layers.add(int(m.group(1)))
 
-def rank0_print(*args):
-    if local_rank in (None, 0, "0", -1):
-        print(*args)
+    if not layers:
+        raise RuntimeError("No LoRA layers found")
 
+    if last_layer < 0:
+        last_layer = max(layers)
 
-def set_requires_grad(params, flag: bool):
-    for p in params:
-        p.requires_grad = flag
+    for p in model.parameters():
+        p.requires_grad = False
 
+    for n, p in model.named_parameters():
+        if "lora_" in n and f".layers.{last_layer}." in n:
+            p.requires_grad = True
 
-def find_lora_targets(model, exclude=None, max_modules=-1):
-    exclude = exclude or []
-    targets = []
-    for name, module in model.named_modules():
-        if any(x in name for x in exclude):
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            targets.append(name)
-    if max_modules and max_modules > 0:
-        targets = targets[-max_modules:]
-    rank0_print(f"[LoRA] target modules = {len(targets)}")
-    return targets
+    print(f"[LoRA] Training ONLY layer {last_layer}")
 
 
 # =========================================================
-# Main train
+# Train
 # =========================================================
 
 def train():
-    global local_rank
-
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    local_rank = training_args.local_rank
 
-    # No video
-    if data_args.fps is not None or data_args.nframes is not None:
-        raise ValueError("Video is not supported for this SFT pipeline.")
+    dtype = torch.float16 if training_args.fp16 else torch.float32
 
-    compute_dtype = (
-        torch.float16 if training_args.fp16
-        else torch.bfloat16 if training_args.bf16
-        else torch.float32
-    )
-
-    # Quantization args
-    bnb_args = {}
-    if training_args.bits in (4, 8):
-        bnb_args["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=training_args.bits == 4,
-            load_in_8bit=training_args.bits == 8,
-            bnb_4bit_compute_dtype=compute_dtype,
-            bnb_4bit_use_double_quant=training_args.double_quant,
-            bnb_4bit_quant_type=training_args.quant_type,
-            llm_int8_skip_modules=["visual", "lm_head"],
-        )
-        bnb_args["device_map"] = {"": training_args.device}
-
-    # Load model
     config = AutoConfig.from_pretrained(model_args.model_id)
     attn_impl = "sdpa"
 
-    if config.model_type == "qwen3_vl_moe":
-        replace_qwen3_vl_moe_with_mixed_modality_forward()
-        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
-        )
-    elif config.model_type == "qwen3_vl":
-        replace_qwen3_with_mixed_modality_forward()
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
-        )
-    elif config.model_type == "qwen2_5_vl":
+    if config.model_type == "qwen2_5_vl":
         replace_qwen2_5_with_mixed_modality_forward()
         replace_qwen2_5_vision()
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
+            model_args.model_id, dtype=dtype, attn_implementation=attn_impl
         )
     else:
         replace_qwen_2_with_mixed_modality_forward()
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_id, dtype=compute_dtype, attn_implementation=attn_impl, **bnb_args
+            model_args.model_id, dtype=dtype, attn_implementation=attn_impl
         )
 
     model.config.use_cache = False
+    model.gradient_checkpointing_enable()  # 🔥 critical
 
-    # Freeze / unfreeze
-    set_requires_grad(model.language_model.parameters(), not training_args.freeze_llm)
-    set_requires_grad(model.lm_head.parameters(), not training_args.freeze_llm)
-    set_requires_grad(model.visual.parameters(), not training_args.freeze_vision_tower)
-
-    # LoRA
     if training_args.lora_enable:
-        exclude = ast.literal_eval(training_args.lora_namespan_exclude) if training_args.lora_namespan_exclude else []
-        exclude += ["visual"]
-
-        lora_cfg = LoraConfig(
+        lora = LoraConfig(
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
             lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            target_modules=find_lora_targets(
-                model, exclude=exclude, max_modules=training_args.num_lora_modules
-            ),
+            target_modules=["q_proj", "v_proj"],
         )
-        model = get_peft_model(model, lora_cfg)
-        rank0_print("LoRA enabled")
+        model = get_peft_model(model, lora)
+        enable_only_last_layer_lora(
+            model,
+            int(os.environ.get("LORA_LAST_LAYER", "-1")),
+        )
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
     data_module = make_supervised_data_module(
-        model_id=model_args.model_id, processor=processor, data_args=data_args
+        model_args.model_id, processor, data_args
     )
 
     trainer = QwenSFTTrainer(
@@ -357,42 +264,21 @@ def train():
         **data_module,
     )
 
-    # Logging callback (FIXED decode)
     trainer.add_callback(
         LogSampleCallback(
-            processor=processor,
-            every_n_steps=(training_args.logging_steps or 50),
+            processor,
+            every_n_steps=training_args.logging_steps or 50,
             max_new_tokens=128,
             save_path=os.path.join(training_args.output_dir, "train_predictions.jsonl"),
-            print_chars=400,
         )
     )
 
-    ckpts = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
-    trainer.train(resume_from_checkpoint=bool(ckpts))
-
+    trainer.train()
     trainer.save_state()
-    model.config.use_cache = True
 
-    # Save
     if training_args.lora_enable:
-        lora_state = get_peft_state_maybe_zero_3(
-            model.named_parameters(), training_args.lora_bias
-        )
-        non_lora_state = get_peft_state_non_lora_maybe_zero_3(
-            model.named_parameters(), require_grad_only=True
-        )
-
-        if local_rank in (0, -1, None, "0"):
-            model.config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=lora_state)
-            processor.save_pretrained(training_args.output_dir)
-            torch.save(
-                non_lora_state,
-                os.path.join(training_args.output_dir, "non_lora_state_dict.bin"),
-            )
-    else:
-        safe_save_model_for_hf_trainer(trainer, output_dir=training_args.output_dir)
+        model.save_pretrained(training_args.output_dir)
+        processor.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":

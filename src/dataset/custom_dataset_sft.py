@@ -15,11 +15,9 @@ from src.constants import (
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IMAGE_TOKEN,
-    SYSTEM_MESSAGE,
 )
 
 from src.dataset.qwen_vl_collator import QwenVLDataCollator
-
 from src.utils import llava_to_openai
 
 
@@ -44,6 +42,11 @@ class SupervisedDataset(Dataset):
 
     Input  : image + critique
     Output : list of editing actions (text)
+
+    NOTE:
+      - Dataset KHÔNG truncate
+      - max_seq_length do Trainer + collator xử lý
+      - metadata chỉ dùng cho logging
     """
 
     def __init__(
@@ -59,11 +62,11 @@ class SupervisedDataset(Dataset):
         self.data_args = data_args
         self.model_id = model_id
 
-        # ===== Load JSONL =====
         self.samples = []
 
+        # ===== Load JSONL =====
         with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_idx, line in enumerate(f):
                 line = line.strip()
                 if not line:
                     continue
@@ -71,8 +74,7 @@ class SupervisedDataset(Dataset):
                 try:
                     obj = json.loads(line)
                 except Exception as e:
-                    print("[WARN] JSON parse error, skip line")
-                    print(line[:200])
+                    print(f"[WARN] JSON parse error at line {line_idx}, skip")
                     print(e)
                     continue
 
@@ -86,14 +88,17 @@ class SupervisedDataset(Dataset):
                 assistant_answer = obj["List of action"]
 
                 self.samples.append({
-                    "Reviewer_ID": obj["ReviewerID"],
+                    # --- identifiers ---
+                    "id": obj.get("ID", f"line_{line_idx}"),
+                    "Post_ID": obj.get("Post_ID"),
+                    "Reviewer_ID": obj.get("ReviewerID"),
+
+                    # --- data ---
                     "image": obj["Image_URL"],
-                    "Post_ID": obj["Post_ID"],
                     "conversations": [
                         {"from": "human", "value": human_prompt},
                         {"from": "gpt", "value": assistant_answer},
                     ],
-                    "id": obj.get("ID", None),
                 })
 
     def __len__(self):
@@ -102,17 +107,20 @@ class SupervisedDataset(Dataset):
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
 
-        # ===== Load raw image (NO preprocessing) =====
+        # ===== Load image =====
         image_path = sample["image"]
-        if not image_path.startswith("http") and not os.path.exists(image_path):
+        if (
+            not image_path.startswith("http")
+            and self.data_args.image_folder is not None
+            and not os.path.exists(image_path)
+        ):
             image_path = os.path.join(self.data_args.image_folder, image_path)
 
         image = load_image(image_path)
 
         # ===== Convert conversation =====
         conv = llava_to_openai(sample["conversations"], is_video=False)
-        user_msg = conv[0]
-        gpt_msg = conv[1]
+        user_msg, gpt_msg = conv
 
         user_text = (
             f"{DEFAULT_IM_START_TOKEN}{user_msg['role']}\n"
@@ -123,7 +131,7 @@ class SupervisedDataset(Dataset):
 
         assistant_text = f"{gpt_msg['content']}{DEFAULT_IM_END_TOKEN}"
 
-        # ===== Encode with Qwen AutoProcessor =====
+        # ===== Encode prompt + image =====
         inputs = self.processor(
             text=user_text,
             images=image,
@@ -131,16 +139,17 @@ class SupervisedDataset(Dataset):
         )
 
         prompt_ids = inputs["input_ids"]          # (1, Lp)
-        pixel_values = inputs["pixel_values"]     # (N, C)
-        image_grid_thw = inputs["image_grid_thw"] # (1, 3)
+        pixel_values = inputs["pixel_values"]
+        image_grid_thw = inputs["image_grid_thw"]
 
+        # ===== Encode response =====
         response_ids = self.processor.tokenizer(
             assistant_text,
             add_special_tokens=False,
             return_tensors="pt",
         )["input_ids"]                            # (1, Lr)
 
-        # ===== Build final input_ids & labels =====
+        # ===== Build final tensors (NO truncate here) =====
         input_ids = torch.cat([prompt_ids, response_ids], dim=1).squeeze(0)
 
         labels = torch.cat(
@@ -154,11 +163,18 @@ class SupervisedDataset(Dataset):
         attention_mask = input_ids != self.processor.tokenizer.pad_token_id
 
         return {
+            # --- training ---
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
+
+            # --- metadata (logging only) ---
+            "sample_id": sample["id"],
+            "post_id": sample["Post_ID"],
+            "reviewer_id": sample["Reviewer_ID"],
+            "image_url": sample["image"],
         }
 
 
@@ -185,5 +201,5 @@ def make_supervised_data_module(model_id, processor, data_args):
     return {
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "data_collator": QwenVLDataCollator(),  # QwenSFTTrainer handles it
+        "data_collator": QwenVLDataCollator(),
     }
