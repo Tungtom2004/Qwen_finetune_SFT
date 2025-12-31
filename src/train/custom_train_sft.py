@@ -4,7 +4,7 @@ import json
 import pathlib
 from datetime import datetime
 from typing import Any, Dict, Optional
-
+import re 
 import torch
 from transformers import (
     AutoProcessor,
@@ -53,36 +53,22 @@ def _to_tensor(x: Any, device: Optional[torch.device] = None) -> torch.Tensor:
 
 
 def ensure_ids_2d(ids: Any, device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Force token ids into shape (B, L).
-    Supports: tensor/list, (L,), (B,L), (B, num_return, L), etc.
-    """
     ids = _to_tensor(ids, device=device)
-
     if ids.ndim == 1:
-        ids = ids.unsqueeze(0)  # (1, L)
+        ids = ids.unsqueeze(0)
     elif ids.ndim == 3:
-        # common from generate: (B, num_return, L)
-        ids = ids[:, 0, :]      # take first
+        ids = ids[:, 0, :]
     elif ids.ndim > 3:
         ids = ids.reshape(ids.shape[0], -1)
     return ids
 
 
 def ensure_grid_thw(grid: Any, device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Qwen2-VL expects image_grid_thw with shape (B, 3).
-    Fix common broken cases:
-      - (3,) -> (1,3)
-      - (B,1,3) -> (B,3)
-    """
     g = _to_tensor(grid, device=device).long()
-
     if g.ndim == 1:
-        g = g.unsqueeze(0)  # (1,3)
+        g = g.unsqueeze(0)
     elif g.ndim == 3 and g.shape[1] == 1 and g.shape[2] == 3:
-        g = g.squeeze(1)    # (B,3)
-
+        g = g.squeeze(1)
     if g.ndim != 2 or g.shape[1] != 3:
         raise ValueError(f"[FATAL] image_grid_thw must be (B,3). Got {tuple(g.shape)}")
     return g
@@ -92,20 +78,10 @@ def ensure_pixel_values(pv: Any, device: Optional[torch.device] = None) -> torch
     return _to_tensor(pv, device=device)
 
 
-def batch_to_device_and_fix(
-    batch: Dict[str, Any],
-    model_device: torch.device,
-) -> Dict[str, Any]:
-    """
-    Move tensors to GPU + fix shapes for Qwen-VL forward.
-    Keep non-tensor metadata (strings/ints/lists) as-is.
-    """
+def batch_to_device_and_fix(batch: Dict[str, Any], model_device: torch.device) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.to(model_device)
-        else:
-            out[k] = v
+        out[k] = v.to(model_device) if isinstance(v, torch.Tensor) else v
 
     if "image_grid_thw" in out and out["image_grid_thw"] is not None:
         out["image_grid_thw"] = ensure_grid_thw(out["image_grid_thw"], device=model_device)
@@ -127,14 +103,6 @@ def batch_to_device_and_fix(
 # =========================================================
 
 class LogSampleCallback(TrainerCallback):
-    """
-    SFT logging (no leakage):
-      - generate ONLY from prompt
-      - decode ONLY newly generated tokens
-      - log sample_id/post_id/reviewer_id/image_url for tracing
-      - DO NOT log golden/labels
-    """
-
     def __init__(
         self,
         processor,
@@ -155,7 +123,6 @@ class LogSampleCallback(TrainerCallback):
 
     @staticmethod
     def _first_of(x):
-        # batch metadata thường là list[str] / list[int] / scalar
         if x is None:
             return None
         if isinstance(x, (list, tuple)):
@@ -173,18 +140,14 @@ class LogSampleCallback(TrainerCallback):
             return
 
         model.eval()
-
-        # 1) get batch
         raw_batch = next(iter(train_dataloader))
         batch = batch_to_device_and_fix(raw_batch, model_device=model.device)
 
-        # ---- extract metadata for tracing ----
         sample_id = self._first_of(batch.get("sample_id"))
         post_id = self._first_of(batch.get("post_id"))
         reviewer_id = self._first_of(batch.get("reviewer_id"))
         image_url = self._first_of(batch.get("image_url"))
 
-        # 2) compute prompt_len from labels IGNORE_INDEX
         labels = batch["labels"]
         IGNORE_INDEX = -100
         prompt_len = int((labels[0] == IGNORE_INDEX).sum().item())
@@ -192,7 +155,6 @@ class LogSampleCallback(TrainerCallback):
         prompt_ids = batch["input_ids"][:, :prompt_len]
         prompt_attention = batch["attention_mask"][:, :prompt_len]
 
-        # 3) generate from PROMPT ONLY
         gen_ids = model.generate(
             input_ids=prompt_ids,
             attention_mask=prompt_attention,
@@ -204,30 +166,20 @@ class LogSampleCallback(TrainerCallback):
         )
 
         gen_ids = ensure_ids_2d(gen_ids, device=None)
-
-        # 4) decode generated part ONLY
         gen_only = gen_ids[:, prompt_ids.shape[1]:]
+
         pred_text = self.processor.tokenizer.batch_decode(
             gen_only, skip_special_tokens=True
-        )[0].strip()
-
-        if pred_text == "":
-            pred_text = "[EMPTY_GENERATION]"
+        )[0].strip() or "[EMPTY_GENERATION]"
 
         record = {
             "time": datetime.now().isoformat(),
             "global_step": int(state.global_step),
-
-            # tracing fields
             "sample_id": sample_id,
             "post_id": post_id,
             "reviewer_id": reviewer_id,
             "image_url": image_url,
-
-            # prediction
             "prediction": pred_text,
-
-            # debug info
             "prompt_len": prompt_len,
             "gen_new_tokens": int(gen_only.shape[1]),
         }
@@ -263,20 +215,77 @@ def set_requires_grad(params, flag: bool):
         p.requires_grad = flag
 
 
-def find_lora_targets(model, exclude=None, max_modules=-1):
-    exclude = exclude or []
-    targets = []
-    for name, module in model.named_modules():
-        if any(x in name for x in exclude):
+def freeze_all_params(model: torch.nn.Module):
+    for p in model.parameters():
+        p.requires_grad = False
+
+
+def enable_only_last_layer_lora(model: torch.nn.Module, last_layer: int = -1):
+    """
+    Enable gradients ONLY for LoRA params belonging to the last transformer layer.
+    Auto-detect last layer index if last_layer == -1.
+    Compatible with param names like:
+      base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A...
+    """
+
+    # 1) collect all layer indices that appear in LoRA param names
+    layer_re = re.compile(r"\.language_model\.layers\.(\d+)\.")
+    lora_names = []
+    layer_ids = set()
+
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
             continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            targets.append(name)
-    if max_modules and max_modules > 0:
-        targets = targets[-max_modules:]
-    rank0_print(f"[LoRA] target modules = {len(targets)}")
-    return targets
+        lora_names.append(name)
+        m = layer_re.search(name)
+        if m:
+            layer_ids.add(int(m.group(1)))
 
+    if len(lora_names) == 0:
+        raise RuntimeError("[FATAL] No LoRA params found at all. get_peft_model() may have failed.")
 
+    if len(layer_ids) == 0:
+        print("[DEBUG] Example LoRA param name:", lora_names[0])
+        raise RuntimeError(
+            "[FATAL] Found LoRA params but cannot parse layer indices.\n"
+            "Your naming does not match .language_model.layers.<i>.\n"
+        )
+
+    detected_last = max(layer_ids)
+    if last_layer is None or int(last_layer) < 0:
+        last_layer = detected_last
+
+    print(f"[LoRA] Detected LoRA layers: min={min(layer_ids)} max={detected_last} (count={len(layer_ids)})")
+    print(f"[LoRA] Using last_layer={last_layer}")
+
+    # 2) Freeze everything first
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 3) Enable only LoRA params in that layer
+    target_re = re.compile(rf"\.language_model\.layers\.{int(last_layer)}\.")
+    trainable = []
+
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        if target_re.search(name):
+            p.requires_grad = True
+            trainable.append(name)
+
+    print(f"[LoRA] Trainable LoRA params in layer {last_layer}: {len(trainable)}")
+    for n in trainable[:20]:
+        print("  ", n)
+
+    if len(trainable) == 0:
+        # show some nearby layer examples for debugging
+        print("\n[DEBUG] No trainable params matched. Showing a few LoRA names:")
+        for n in lora_names[:30]:
+            print(" ", n)
+        raise RuntimeError(
+            "[FATAL] No trainable params after enabling last-layer LoRA.\n"
+            "→ Either last_layer index is wrong, or model doesn't have that layer.\n"
+        )
 # =========================================================
 # Main train
 # =========================================================
@@ -288,7 +297,6 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
 
-    # No video
     if data_args.fps is not None or data_args.nframes is not None:
         raise ValueError("Video is not supported for this SFT pipeline.")
 
@@ -298,7 +306,6 @@ def train():
         else torch.float32
     )
 
-    # Quantization args
     bnb_args = {}
     if training_args.bits in (4, 8):
         bnb_args["quantization_config"] = BitsAndBytesConfig(
@@ -311,7 +318,6 @@ def train():
         )
         bnb_args["device_map"] = {"": training_args.device}
 
-    # Load model
     config = AutoConfig.from_pretrained(model_args.model_id)
     attn_impl = "sdpa"
 
@@ -339,33 +345,29 @@ def train():
 
     model.config.use_cache = False
 
-    # Freeze / unfreeze
-    set_requires_grad(model.language_model.parameters(), not training_args.freeze_llm)
-    set_requires_grad(model.lm_head.parameters(), not training_args.freeze_llm)
-    set_requires_grad(model.visual.parameters(), not training_args.freeze_vision_tower)
+    # =========================
+    # LoRA: ONLY LAST LAYER (Qwen2-VL-7B -> 31)
+    # =========================
+    LAST_LAYER = int(os.environ.get("LORA_LAST_LAYER", "27"))
 
-    # =========================
-    # LoRA: ONLY 1 LAYER
-    # =========================
     if training_args.lora_enable:
-        # FIX: os.environ.get, not os.environ(...)
-        LORA_LAYER_INDEX = int(os.environ.get("LORA_LAYER_INDEX", "31"))
-        target_modules = ["q_proj", "v_proj"]
-
         lora_cfg = LoraConfig(
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
-
-            target_modules=target_modules,
-            layers_to_transform=[LORA_LAYER_INDEX],
-            layers_pattern="layers",
-            exclude_modules=".*visual.*",
+            target_modules=["q_proj", "v_proj"],
         )
 
         model = get_peft_model(model, lora_cfg)
-        rank0_print(f"[LoRA] Enabled on layer={LORA_LAYER_INDEX}, targets={target_modules}")
+
+        # auto-detect last layer unless you override by env
+        # export LORA_LAST_LAYER=31 (if you want force)
+        last_layer_env = int(os.environ.get("LORA_LAST_LAYER", "-1"))
+        enable_only_last_layer_lora(model, last_layer=last_layer_env)
+
+        rank0_print(f"[LoRA] Enabled ONLY last layer (auto or env override)")
+
 
     processor = AutoProcessor.from_pretrained(model_args.model_id)
 
@@ -396,7 +398,6 @@ def train():
     trainer.save_state()
     model.config.use_cache = True
 
-    # Save
     if training_args.lora_enable:
         lora_state = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
